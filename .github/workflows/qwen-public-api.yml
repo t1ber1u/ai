@@ -1,0 +1,111 @@
+name: Qwen Public API
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_url:
+        description: "GGUF model URL (default: Qwen3-4B-Instruct-2507 Q4_K_M)"
+        required: false
+        default: "https://huggingface.co/z8086486/Qwen3-4B-Instruct-2507-Q4_K_M-GGUF/resolve/main/qwen3-4b-instruct-2507-q4_k_m.gguf"
+        type: string
+  schedule:
+    # 14:00 UTC = 17:00 Romania during EEST (UTC+3)
+    - cron: "0 14 * * *"
+
+jobs:
+  qwen-api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      MODEL_URL: ${{ inputs.model_url || 'https://huggingface.co/z8086486/Qwen3-4B-Instruct-2507-Q4_K_M-GGUF/resolve/main/qwen3-4b-instruct-2507-q4_k_m.gguf' }}
+      MODEL_FILE: models/qwen3-4b-instruct-2507-q4.gguf
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential curl wget
+
+      - name: Build llama.cpp
+        run: |
+          git clone https://github.com/ggml-org/llama.cpp.git
+          cmake -B llama.cpp/build -S llama.cpp -DCMAKE_BUILD_TYPE=Release
+          cmake --build llama.cpp/build --config Release -j 4
+          ls -la llama.cpp/build/bin
+
+      - name: Download GGUF model
+        run: |
+          mkdir -p models
+          echo "MODEL_URL=$MODEL_URL"
+          curl -L --fail --retry 3 --retry-delay 5 \
+            -o "$MODEL_FILE" "$MODEL_URL"
+          ls -lh "$MODEL_FILE"
+
+      - name: Install cloudflared
+        run: |
+          wget -q -O /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Start llama-server
+        env:
+          LLAMA_API_KEY: ${{ secrets.LLAMA_API_KEY }}
+        run: |
+          API_KEY_ARG=()
+          if [ -n "${LLAMA_API_KEY:-}" ]; then
+            echo "API key auth: ENABLED (LLAMA_API_KEY secret is set)."
+            API_KEY_ARG=(--api-key "$LLAMA_API_KEY")
+          else
+            echo "API key auth: DISABLED — endpoint will be UNAUTHENTICATED."
+          fi
+
+          nohup llama.cpp/build/bin/llama-server \
+            -m "$MODEL_FILE" \
+            --host 127.0.0.1 \
+            --port 8000 \
+            --ctx-size 4096 \
+            --threads 4 \
+            "${API_KEY_ARG[@]}" \
+            > llama-server.log 2>&1 &
+
+          echo "Waiting for server to come up (up to 180s)..."
+          for i in $(seq 1 180); do
+            if curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; then
+              echo "Server up after ${i}s."
+              break
+            fi
+            sleep 1
+          done
+
+          echo "=== Last 80 lines of llama-server.log ==="
+          tail -80 llama-server.log || true
+
+          echo "=== Health check ==="
+          curl -s http://127.0.0.1:8000/health || true
+          echo
+
+      - name: Start Cloudflare Tunnel (keeps job alive)
+        env:
+          CLOUDFLARED_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARED_TUNNEL_TOKEN }}
+        run: |
+          if [ -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" ]; then
+            echo "Tunnel mode: NAMED (using CLOUDFLARED_TUNNEL_TOKEN secret)."
+            echo "Public URL = the hostname you configured in Cloudflare Zero Trust."
+            cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARED_TUNNEL_TOKEN"
+          else
+            echo "Tunnel mode: EPHEMERAL (trycloudflare.com)."
+            echo "Look in the lines below for: https://<random>.trycloudflare.com"
+            cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8000
+          fi
+
+      - name: Upload llama-server log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-server-log
+          path: llama-server.log
