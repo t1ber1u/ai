@@ -1,0 +1,8 @@
+models/
+llama.cpp/
+build/
+*.gguf
+*.bin
+.cache/
+__pycache__/
+.DS_Store
