@@ -81,7 +81,9 @@ set +e
   --temp 0.2 \
   --top-p 0.8 \
   --repeat-penalty 1.1 \
-  2>&1 | tee benchmark-output.log
+  -no-cnv \
+  --simple-io \
+  </dev/null 2>&1 | tee benchmark-output.log
 LLAMA_EXIT=${PIPESTATUS[0]}
 set -e
 
