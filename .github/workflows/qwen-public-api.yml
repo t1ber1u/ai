@@ -8,6 +8,11 @@ on:
         required: false
         default: "https://huggingface.co/z8086486/Qwen3-4B-Instruct-2507-Q4_K_M-GGUF/resolve/main/qwen3-4b-instruct-2507-q4_k_m.gguf"
         type: string
+      ctx_size:
+        description: "Context window in tokens (Qwen3-4B trained to 262144). Memory: ~144 KB/token KV. 16384=~2.3GB, 32768=~4.6GB."
+        required: false
+        default: "16384"
+        type: string
   schedule:
     # 14:00 UTC = 17:00 Romania during EEST (UTC+3)
     - cron: "0 14 * * *"
@@ -19,6 +24,7 @@ jobs:
     env:
       MODEL_URL: ${{ inputs.model_url || 'https://huggingface.co/z8086486/Qwen3-4B-Instruct-2507-Q4_K_M-GGUF/resolve/main/qwen3-4b-instruct-2507-q4_k_m.gguf' }}
       MODEL_FILE: models/qwen3-4b-instruct-2507-q4.gguf
+      CTX_SIZE: ${{ inputs.ctx_size || '16384' }}
 
     steps:
       - name: Checkout
@@ -71,13 +77,14 @@ jobs:
           fi
           echo "Binding to:               127.0.0.1:8000"
           echo "Model file:               $MODEL_FILE"
+          echo "Context size:             ${CTX_SIZE} tokens"
           echo
 
           nohup llama.cpp/build/bin/llama-server \
             -m "$MODEL_FILE" \
             --host 127.0.0.1 \
             --port 8000 \
-            --ctx-size 4096 \
+            --ctx-size "$CTX_SIZE" \
             --threads 4 \
             "${API_KEY_ARG[@]}" \
             > llama-server.log 2>&1 &
