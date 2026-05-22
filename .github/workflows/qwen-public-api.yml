@@ -56,13 +56,22 @@ jobs:
         env:
           LLAMA_API_KEY: ${{ secrets.LLAMA_API_KEY }}
         run: |
-          API_KEY_ARG=()
+          echo "================================================================"
+          echo "Step: Start llama-server"
+          echo "================================================================"
+
           if [ -n "${LLAMA_API_KEY:-}" ]; then
-            echo "API key auth: ENABLED (LLAMA_API_KEY secret is set)."
+            echo "LLAMA_API_KEY:            SET (value masked by GitHub Actions)"
+            echo "API key auth:             ENABLED  (--api-key passed to llama-server)"
             API_KEY_ARG=(--api-key "$LLAMA_API_KEY")
           else
-            echo "API key auth: DISABLED — endpoint will be UNAUTHENTICATED."
+            echo "LLAMA_API_KEY:            NOT SET"
+            echo "API key auth:             DISABLED (endpoint will be UNAUTHENTICATED)"
+            API_KEY_ARG=()
           fi
+          echo "Binding to:               127.0.0.1:8000"
+          echo "Model file:               $MODEL_FILE"
+          echo
 
           nohup llama.cpp/build/bin/llama-server \
             -m "$MODEL_FILE" \
@@ -72,35 +81,76 @@ jobs:
             --threads 4 \
             "${API_KEY_ARG[@]}" \
             > llama-server.log 2>&1 &
+          SERVER_PID=$!
+          echo "Started llama-server PID=$SERVER_PID"
 
-          echo "Waiting for server to come up (up to 180s)..."
+          echo
+          echo "--- Waiting for /health to return 200 (up to 180s) ---"
+          SERVER_UP=0
           for i in $(seq 1 180); do
             if curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; then
-              echo "Server up after ${i}s."
+              echo "Server reports healthy after ${i}s."
+              SERVER_UP=1
               break
             fi
             sleep 1
           done
 
-          echo "=== Last 80 lines of llama-server.log ==="
+          echo
+          echo "--- Last 80 lines of llama-server.log ---"
           tail -80 llama-server.log || true
-
-          echo "=== Health check ==="
-          curl -s http://127.0.0.1:8000/health || true
           echo
 
-      - name: Start Cloudflare Tunnel (keeps job alive)
+          if [ "$SERVER_UP" -ne 1 ]; then
+            echo "ERROR: llama-server did not become healthy within 180s."
+            echo "Aborting before starting the Cloudflare tunnel."
+            exit 1
+          fi
+
+          echo "--- Local probe: GET /health ---"
+          curl -s -w '\nHTTP_STATUS=%{http_code}\n' http://127.0.0.1:8000/health
+          echo
+
+          echo "--- Local probe: POST /v1/chat/completions ---"
+          AUTH_HEADER=()
+          if [ -n "${LLAMA_API_KEY:-}" ]; then
+            AUTH_HEADER=(-H "Authorization: Bearer ${LLAMA_API_KEY}")
+          fi
+          curl -s --max-time 60 \
+            "${AUTH_HEADER[@]}" \
+            -H "Content-Type: application/json" \
+            -d '{"messages":[{"role":"user","content":"Raspunde scurt in romana: salut"}],"max_tokens":32,"temperature":0.2}' \
+            -w '\nHTTP_STATUS=%{http_code}\n' \
+            http://127.0.0.1:8000/v1/chat/completions || true
+          echo
+          echo "(If HTTP_STATUS=200 and JSON contains a choices[].message, the server is fully working locally.)"
+
+      - name: Start Cloudflare Tunnel (keeps job alive for up to 6h)
         env:
           CLOUDFLARED_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARED_TUNNEL_TOKEN }}
         run: |
+          echo "================================================================"
+          echo "Step: Start Cloudflare Tunnel"
+          echo "================================================================"
+
           if [ -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" ]; then
-            echo "Tunnel mode: NAMED (using CLOUDFLARED_TUNNEL_TOKEN secret)."
-            echo "Public URL = the hostname you configured in Cloudflare Zero Trust."
-            cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARED_TUNNEL_TOKEN"
+            echo "CLOUDFLARED_TUNNEL_TOKEN: SET (value masked by GitHub Actions)"
+            echo "Tunnel mode:              NAMED"
+            echo "Expected public URL:      whatever public hostname you mapped in"
+            echo "                          Cloudflare → Tunnels → qwen-api → Published"
+            echo "                          application routes (e.g. https://qwen.price.com.ro)"
+            echo "Endpoint:                 <public URL>/v1/chat/completions"
+            echo
+            echo "Running: cloudflared tunnel run --token \$CLOUDFLARED_TUNNEL_TOKEN"
+            echo "This step blocks until the 6h job timeout, manual cancel, or tunnel error."
+            echo
+            exec cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARED_TUNNEL_TOKEN"
           else
-            echo "Tunnel mode: EPHEMERAL (trycloudflare.com)."
-            echo "Look in the lines below for: https://<random>.trycloudflare.com"
-            cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8000
+            echo "CLOUDFLARED_TUNNEL_TOKEN: NOT SET"
+            echo "Tunnel mode:              EPHEMERAL (trycloudflare.com)"
+            echo "Look in the cloudflared output below for: https://<random>.trycloudflare.com"
+            echo
+            exec cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8000
           fi
 
       - name: Upload llama-server log

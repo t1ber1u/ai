@@ -160,23 +160,75 @@ URL that changes on every run.
 
 ### Test it
 
+The currently deployed named tunnel in this repo is wired to:
+
+- **Public hostname:** `qwen.price.com.ro`
+- **Service:** `HTTP localhost:8000`
+- **Tunnel:** `qwen-api` (in the `catalizatoare@gmail.com` Cloudflare account)
+
+While the workflow is running, from any machine:
+
 ```bash
-curl https://qwen.yourdomain.com/v1/chat/completions \
+curl https://qwen.price.com.ro/v1/chat/completions \
+  -H "Authorization: Bearer <LLAMA_API_KEY>" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_LLAMA_API_KEY" \
   -d '{
     "messages": [
-      {"role": "system", "content": "Raspunde scurt, natural, in romana."},
-      {"role": "user",   "content": "Ce este inteligenta artificiala?"}
+      {"role": "user", "content": "Raspunde scurt in romana: salut"}
     ],
-    "max_tokens": 80,
+    "max_tokens": 32,
     "temperature": 0.2
   }'
 ```
 
-For the **ephemeral** mode, replace the host with whatever
-`*.trycloudflare.com` URL appears in the workflow logs (search the
-"Start Cloudflare Tunnel" step output for `trycloudflare.com`).
+Replace `<LLAMA_API_KEY>` with the value you stored in the GitHub
+`LLAMA_API_KEY` secret. Expected: a JSON response with
+`choices[0].message.content` in ~3–6 s on a warm model.
+
+For the **ephemeral** fallback (if `CLOUDFLARED_TUNNEL_TOKEN` is removed
+from the repo secrets), replace the host with the `*.trycloudflare.com`
+URL printed in the workflow's "Start Cloudflare Tunnel" step.
+
+---
+
+## How to run the public API workflow
+
+1. **Actions → Qwen Public API → Run workflow** (or wait for the
+   scheduled 14:00 UTC daily run).
+2. Watch the logs. Key signals to confirm the run is healthy:
+   - `Step: Start llama-server` → `LLAMA_API_KEY: SET` → `Server reports healthy after Ns.` → local `HTTP_STATUS=200` on both `/health` and `/v1/chat/completions`.
+   - `Step: Start Cloudflare Tunnel` → `CLOUDFLARED_TUNNEL_TOKEN: SET` → `Tunnel mode: NAMED` → cloudflared lines like `Registered tunnel connection` × 4.
+3. In Cloudflare Zero Trust → Networks → Tunnels, the `qwen-api`
+   tunnel flips from **Inactive** to **Healthy**.
+4. Call `https://qwen.price.com.ro/v1/chat/completions` from outside.
+
+The job keeps running (and the tunnel keeps routing) until the 6h
+GitHub-Actions timeout, until you cancel the run from the Actions UI,
+or until cloudflared/llama-server errors out.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause / where to look |
+|---|---|
+| Cloudflare tunnel stays **Inactive** while the workflow runs | `cloudflared` didn't connect. Check the "Start Cloudflare Tunnel" step output for auth errors. Most common: `CLOUDFLARED_TUNNEL_TOKEN` secret is missing, expired, or from a deleted tunnel. Recreate the tunnel in Cloudflare and update the secret. |
+| Step header prints `Tunnel mode: EPHEMERAL` and a `trycloudflare.com` URL | `CLOUDFLARED_TUNNEL_TOKEN` is not detected. The secret is missing, named differently, or scoped to environment instead of repository. Re-check GitHub → Settings → Secrets and variables → Actions. |
+| Tunnel is **Healthy** but `curl https://qwen.price.com.ro/...` returns 502 / 530 / 1033 | The public hostname → service mapping is wrong. In Cloudflare → Tunnels → `qwen-api` → **Published application routes**, confirm hostname `qwen.price.com.ro`, type **HTTP**, URL **`localhost:8000`**. |
+| Workflow step `Start llama-server` exits with `ERROR: llama-server did not become healthy within 180s.` | llama-server crashed during boot. Check `llama-server.log` (also uploaded as artifact). Usually OOM, corrupt GGUF, or unsupported quant. |
+| Local probe `POST /v1/chat/completions` returns `401` or `403` | API key mismatch. Either the workflow started without `LLAMA_API_KEY` (then *don't* send `Authorization`) or you're calling with a different key than what's stored in the secret. |
+| External `curl` returns `401` | Caller didn't send `Authorization: Bearer <LLAMA_API_KEY>`, or sent the wrong key. The repo `LLAMA_API_KEY` secret value is what you must match. |
+| External `curl` returns Cloudflare 1033 ("Argo Tunnel error") | No `cloudflared` connector is online. Workflow probably ended (job hit 6h or was cancelled). Re-run the workflow. |
+| External `curl` returns 404 on the hostname | DNS for `qwen.price.com.ro` doesn't resolve to Cloudflare, or the hostname route was deleted. Confirm the route still exists in the tunnel. |
+| Step takes >5 min on "Build llama.cpp" every run | Normal — no caching here. Could be added with `actions/cache` over `llama.cpp/build`, but the build is reliable and we haven't bothered. |
+
+### Confirming `llama-server` API key support
+
+The `--api-key` flag is supported by `llama-server` in current llama.cpp
+builds (the workflow builds from `ggml-org/llama.cpp` `main`). When set,
+the server returns `401 Unauthorized` to any request without
+`Authorization: Bearer <key>`. No proxy needed — auth is handled by
+llama-server itself.
 
 ---
 
